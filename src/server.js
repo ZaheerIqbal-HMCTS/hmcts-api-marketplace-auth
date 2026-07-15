@@ -11,6 +11,12 @@ const db = require('./db');
 
 const app = express();
 
+// Render (and most hosting platforms) sit behind a reverse proxy, which adds
+// an X-Forwarded-For header identifying the real client IP. Express needs to
+// be told to trust this, otherwise express-rate-limit throws a validation
+// error on every request and login/registration silently fail.
+app.set('trust proxy', 1);
+
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
 const COOKIE_NAME = 'hmcts_marketplace_session';
