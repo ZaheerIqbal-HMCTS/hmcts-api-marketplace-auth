@@ -7,7 +7,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 
-const db = require('./db');
+const { pool, initDb } = require('./db');
 
 const app = express();
 
@@ -29,11 +29,6 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
-// --- Middleware -----------------------------------------------------------
-
-// Allow the static front end (e.g. your GitHub Pages site) to call this API
-// with credentials (cookies). Set FRONTEND_ORIGIN in .env to the exact origin
-// your site is served from, e.g. https://zaheeriqbal-hmcts.github.io
 const allowedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:8000';
 app.use(
   cors({
@@ -45,16 +40,13 @@ app.use(
 app.use(express.json());
 app.use(cookieParser());
 
-// Basic protection against brute-force login/register attempts.
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many attempts. Please try again later.' },
 });
-
-// --- Helpers ---------------------------------------------------------------
 
 function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
@@ -68,10 +60,10 @@ function issueSessionCookie(res, user) {
   );
 
   res.cookie(COOKIE_NAME, token, {
-    httpOnly: true, // not readable by client-side JS - protects against XSS token theft
-    secure: IS_PRODUCTION, // only sent over HTTPS in production
-    sameSite: IS_PRODUCTION ? 'none' : 'lax', // 'none' needed for cross-site (GitHub Pages -> your API host)
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
+    httpOnly: true,
+    secure: IS_PRODUCTION,
+    sameSite: IS_PRODUCTION ? 'none' : 'lax',
+    maxAge: 7 * 24 * 60 * 60 * 1000,
   });
 }
 
@@ -87,80 +79,88 @@ function requireAuth(req, res, next) {
   }
 }
 
-// --- Routes ------------------------------------------------------------
+function toPublicUser(row) {
+  return {
+    id: row.id,
+    firstName: row.first_name,
+    lastName: row.last_name,
+    email: row.email,
+    role: row.role,
+  };
+}
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
 app.post('/api/register', authLimiter, async (req, res) => {
-  const { firstName, lastName, email, organisation, role, password } = req.body || {};
+  try {
+    const { firstName, lastName, email, organisation, role, password } = req.body || {};
 
-  if (!firstName || !lastName || !email || !role || !password) {
-    return res.status(400).json({ error: 'Missing required fields.' });
-  }
-  if (!isValidEmail(email)) {
-    return res.status(400).json({ error: 'Enter a valid email address.' });
-  }
-  if (!['consumer', 'producer'].includes(role)) {
-    return res.status(400).json({ error: 'Role must be "consumer" or "producer".' });
-  }
-  if (typeof password !== 'string' || password.length < 12) {
-    return res.status(400).json({ error: 'Password must be at least 12 characters long.' });
-  }
+    if (!firstName || !lastName || !email || !role || !password) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address.' });
+    }
+    if (!['consumer', 'producer'].includes(role)) {
+      return res.status(400).json({ error: 'Role must be "consumer" or "producer".' });
+    }
+    if (typeof password !== 'string' || password.length < 12) {
+      return res.status(400).json({ error: 'Password must be at least 12 characters long.' });
+    }
 
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.toLowerCase());
-  if (existing) {
-    // Deliberately vague to avoid confirming which emails are registered.
-    return res.status(409).json({ error: 'An account with these details could not be created.' });
-  }
+    const normalizedEmail = email.toLowerCase();
 
-  const passwordHash = await bcrypt.hash(password, 12);
+    const existing = await pool.query('SELECT id FROM users WHERE email = $1', [normalizedEmail]);
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'An account with these details could not be created.' });
+    }
 
-  const result = db
-    .prepare(
+    const passwordHash = await bcrypt.hash(password, 12);
+
+    const result = await pool.query(
       `INSERT INTO users (first_name, last_name, email, organisation, role, password_hash)
-       VALUES (?, ?, ?, ?, ?, ?)`
-    )
-    .run(firstName, lastName, email.toLowerCase(), organisation || null, role, passwordHash);
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING id, first_name, last_name, email, role`,
+      [firstName, lastName, normalizedEmail, organisation || null, role, passwordHash]
+    );
 
-  const user = { id: result.lastInsertRowid, email: email.toLowerCase(), role };
-  issueSessionCookie(res, user);
+    const user = result.rows[0];
+    issueSessionCookie(res, user);
 
-  res.status(201).json({
-    user: { id: user.id, firstName, lastName, email: user.email, role },
-  });
+    res.status(201).json({ user: toPublicUser(user) });
+  } catch (err) {
+    console.error('Register error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
 });
 
 app.post('/api/login', authLimiter, async (req, res) => {
-  const { email, password } = req.body || {};
+  try {
+    const { email, password } = req.body || {};
 
-  if (!email || !password) {
-    return res.status(400).json({ error: 'Email and password are required.' });
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password are required.' });
+    }
+
+    const result = await pool.query('SELECT * FROM users WHERE email = $1', [email.toLowerCase()]);
+    const user = result.rows[0];
+
+    const passwordHash = user ? user.password_hash : '$2a$12$invalidsaltinvalidsaltinvalidsalte';
+    const passwordMatches = await bcrypt.compare(password, passwordHash);
+
+    if (!user || !passwordMatches) {
+      return res.status(401).json({ error: 'Incorrect email or password.' });
+    }
+
+    issueSessionCookie(res, user);
+
+    res.json({ user: toPublicUser(user) });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
-
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email.toLowerCase());
-
-  // Always run bcrypt.compare even if user is missing, using a dummy hash,
-  // so response timing doesn't reveal whether the email exists.
-  const passwordHash = user ? user.password_hash : '$2a$12$invalidsaltinvalidsaltinvalidsalte';
-  const passwordMatches = await bcrypt.compare(password, passwordHash);
-
-  if (!user || !passwordMatches) {
-    return res.status(401).json({ error: 'Incorrect email or password.' });
-  }
-
-  issueSessionCookie(res, user);
-
-  res.json({
-    user: {
-      id: user.id,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      email: user.email,
-      role: user.role,
-    },
-  });
 });
 
 app.post('/api/logout', (req, res) => {
@@ -168,22 +168,27 @@ app.post('/api/logout', (req, res) => {
   res.json({ ok: true });
 });
 
-app.get('/api/me', requireAuth, (req, res) => {
-  const user = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.sub);
-  if (!user) return res.status(401).json({ error: 'Not signed in.' });
+app.get('/api/me', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.sub]);
+    const user = result.rows[0];
+    if (!user) return res.status(401).json({ error: 'Not signed in.' });
 
-  res.json({
-    user: {
-      id: user.id,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      email: user.email,
-      role: user.role,
-    },
+    res.json({ user: toPublicUser(user) });
+  } catch (err) {
+    console.error('/api/me error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+initDb()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`HMCTS API Marketplace auth server listening on http://localhost:${PORT}`);
+      console.log(`Accepting requests from: ${allowedOrigin}`);
+    });
+  })
+  .catch((err) => {
+    console.error('Failed to initialise database:', err);
+    process.exit(1);
   });
-});
-
-app.listen(PORT, () => {
-  console.log(`HMCTS API Marketplace auth server listening on http://localhost:${PORT}`);
-  console.log(`Accepting requests from: ${allowedOrigin}`);
-});
