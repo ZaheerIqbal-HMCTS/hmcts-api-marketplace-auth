@@ -6,6 +6,7 @@ const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 
 const { pool, initDb } = require('./db');
 
@@ -37,6 +38,29 @@ app.use(
   })
 );
 
+// Email is optional - if SMTP isn't configured, access requests are still
+// stored in the database, but no email is actually sent (the request just
+// gets logged instead). This means the feature degrades gracefully rather
+// than crashing if someone hasn't set up SMTP yet.
+let mailTransporter = null;
+if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
+  mailTransporter = nodemailer.createTransport({
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT) || 587,
+    secure: process.env.SMTP_PORT === '465',
+    auth: {
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS,
+    },
+  });
+  console.log('SMTP configured - access request emails will actually be sent.');
+} else {
+  console.log(
+    'SMTP not configured - access requests will be stored but no email will be sent. ' +
+    'Set SMTP_HOST, SMTP_USER, SMTP_PASS (and optionally SMTP_PORT) to enable real emails.'
+  );
+}
+
 app.use(express.json());
 app.use(cookieParser());
 
@@ -52,6 +76,14 @@ function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
+function cookieOptions() {
+  return {
+    httpOnly: true, // not readable by client-side JS - protects against XSS token theft
+    secure: IS_PRODUCTION, // only sent over HTTPS in production
+    sameSite: IS_PRODUCTION ? 'none' : 'lax', // 'none' needed for cross-site (GitHub Pages -> your API host)
+  };
+}
+
 function issueSessionCookie(res, user) {
   const token = jwt.sign(
     { sub: user.id, email: user.email, role: user.role },
@@ -60,10 +92,8 @@ function issueSessionCookie(res, user) {
   );
 
   res.cookie(COOKIE_NAME, token, {
-    httpOnly: true,
-    secure: IS_PRODUCTION,
-    sameSite: IS_PRODUCTION ? 'none' : 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    ...cookieOptions(),
+    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
   });
 }
 
@@ -91,6 +121,59 @@ function toPublicUser(row) {
 
 app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
+});
+
+app.post('/api/requests/access', authLimiter, async (req, res) => {
+  try {
+    const { fullName, organisation, email, jobTitle, apiName, environment, callVolume, useCase } = req.body || {};
+
+    if (!fullName || !organisation || !email || !apiName || !environment || !useCase) {
+      return res.status(400).json({ error: 'Missing required fields.' });
+    }
+    if (!isValidEmail(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address.' });
+    }
+
+    const reference = 'AR-' + new Date().getFullYear() + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
+
+    await pool.query(
+      `INSERT INTO access_requests (full_name, organisation, email, job_title, api_name, environment, call_volume, use_case, reference)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [fullName, organisation, email, jobTitle || null, apiName, environment, callVolume || null, useCase, reference]
+    );
+
+    if (mailTransporter && process.env.API_OWNER_EMAIL) {
+      try {
+        await mailTransporter.sendMail({
+          from: process.env.SMTP_FROM || process.env.SMTP_USER,
+          to: process.env.API_OWNER_EMAIL,
+          replyTo: email,
+          subject: `[HMCTS API Marketplace] Access request for ${apiName} (${reference})`,
+          text:
+            `A new API access request has been submitted.\n\n` +
+            `Reference: ${reference}\n` +
+            `API requested: ${apiName}\n` +
+            `Environment: ${environment}\n` +
+            `Expected call volume: ${callVolume || 'Not specified'}\n\n` +
+            `Requested by: ${fullName}${jobTitle ? ' (' + jobTitle + ')' : ''}\n` +
+            `Organisation: ${organisation}\n` +
+            `Email: ${email}\n\n` +
+            `Use case:\n${useCase}\n`,
+        });
+      } catch (mailErr) {
+        // Don't fail the whole request just because email sending had a problem -
+        // the request is already safely stored in the database either way.
+        console.error('Failed to send access request email:', mailErr);
+      }
+    } else {
+      console.log(`Access request ${reference} stored (no email sent - SMTP/API_OWNER_EMAIL not fully configured).`);
+    }
+
+    res.status(201).json({ reference });
+  } catch (err) {
+    console.error('Access request error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
 });
 
 app.post('/api/register', authLimiter, async (req, res) => {
@@ -164,7 +247,7 @@ app.post('/api/login', authLimiter, async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  res.clearCookie(COOKIE_NAME);
+  res.clearCookie(COOKIE_NAME, cookieOptions());
   res.json({ ok: true });
 });
 
