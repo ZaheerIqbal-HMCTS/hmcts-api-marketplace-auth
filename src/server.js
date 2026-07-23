@@ -2,7 +2,6 @@ require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
@@ -20,7 +19,6 @@ app.set('trust proxy', 1);
 
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET;
-const COOKIE_NAME = 'hmcts_marketplace_session';
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 
 if (!JWT_SECRET) {
@@ -30,11 +28,18 @@ if (!JWT_SECRET) {
   process.exit(1);
 }
 
+// Auth uses a bearer token (sent in the Authorization header, stored by the
+// browser in localStorage) rather than a cookie. This is a deliberate choice:
+// the front end (GitHub Pages) and this API (Render) live on two completely
+// different domains, and modern browsers increasingly block or restrict
+// cookies set across different sites ("third-party cookies") even with
+// SameSite=None configured correctly. A bearer token sidesteps that
+// entirely, since it's sent explicitly by the page's own JavaScript rather
+// than relying on the browser to attach a cookie automatically.
 const allowedOrigin = process.env.FRONTEND_ORIGIN || 'http://localhost:8000';
 app.use(
   cors({
     origin: allowedOrigin,
-    credentials: true,
   })
 );
 
@@ -62,7 +67,6 @@ if (process.env.SMTP_HOST && process.env.SMTP_USER && process.env.SMTP_PASS) {
 }
 
 app.use(express.json());
-app.use(cookieParser());
 
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -76,29 +80,17 @@ function isValidEmail(email) {
   return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
-function cookieOptions() {
-  return {
-    httpOnly: true, // not readable by client-side JS - protects against XSS token theft
-    secure: IS_PRODUCTION, // only sent over HTTPS in production
-    sameSite: IS_PRODUCTION ? 'none' : 'lax', // 'none' needed for cross-site (GitHub Pages -> your API host)
-  };
-}
-
-function issueSessionCookie(res, user) {
-  const token = jwt.sign(
+function issueToken(user) {
+  return jwt.sign(
     { sub: user.id, email: user.email, role: user.role },
     JWT_SECRET,
     { expiresIn: '7d' }
   );
-
-  res.cookie(COOKIE_NAME, token, {
-    ...cookieOptions(),
-    maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days
-  });
 }
 
 function requireAuth(req, res, next) {
-  const token = req.cookies[COOKIE_NAME];
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
   if (!token) return res.status(401).json({ error: 'Not signed in.' });
 
   try {
@@ -210,9 +202,9 @@ app.post('/api/register', authLimiter, async (req, res) => {
     );
 
     const user = result.rows[0];
-    issueSessionCookie(res, user);
+    const token = issueToken(user);
 
-    res.status(201).json({ user: toPublicUser(user) });
+    res.status(201).json({ user: toPublicUser(user), token });
   } catch (err) {
     console.error('Register error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
@@ -237,9 +229,9 @@ app.post('/api/login', authLimiter, async (req, res) => {
       return res.status(401).json({ error: 'Incorrect email or password.' });
     }
 
-    issueSessionCookie(res, user);
+    const token = issueToken(user);
 
-    res.json({ user: toPublicUser(user) });
+    res.json({ user: toPublicUser(user), token });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
@@ -247,7 +239,9 @@ app.post('/api/login', authLimiter, async (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  res.clearCookie(COOKIE_NAME, cookieOptions());
+  // Nothing to do server-side - the token lives in the browser's localStorage,
+  // not a cookie, so "logging out" just means the client deletes its copy.
+  // This endpoint is kept for compatibility with the front end's existing call.
   res.json({ ok: true });
 });
 
