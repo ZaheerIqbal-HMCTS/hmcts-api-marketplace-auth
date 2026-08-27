@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
@@ -254,6 +255,233 @@ app.get('/api/me', requireAuth, async (req, res) => {
     res.json({ user: toPublicUser(user) });
   } catch (err) {
     console.error('/api/me error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Applications - "my applications and teams", Phase 1 (see the design doc:
+// no teams yet, every application is owned directly by the user who created
+// it - owner is always { type: 'user', id: <user id> }).
+
+const ENVIRONMENTS = ['sandbox', 'development', 'integration-test', 'production'];
+
+function toPublicApplication(row) {
+  return {
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    environment: row.environment,
+    owner: { type: row.owner_type, id: row.owner_id },
+    publicKeyUrl: row.public_key_url,
+    callbackUrl: row.callback_url,
+    customAttributes: row.custom_attributes,
+    connectedApis: row.connected_apis,
+    createdAt: row.created_at,
+  };
+}
+
+function newApiKey() {
+  return 'amp_' + crypto.randomBytes(24).toString('hex');
+}
+
+async function issueApiKey(applicationId) {
+  const rawKey = newApiKey();
+  const keyHash = await bcrypt.hash(rawKey, 12);
+  const keyId = crypto.randomUUID();
+  await pool.query(
+    `INSERT INTO api_keys (id, application_id, key_hash, key_preview) VALUES ($1, $2, $3, $4)`,
+    [keyId, applicationId, keyHash, rawKey.slice(-4)]
+  );
+  return { id: keyId, rawKey };
+}
+
+// Loads an application and checks the current user owns it, writing the
+// appropriate error response and returning null if not - every route below
+// that takes :id calls this first and returns immediately when it does.
+async function loadOwnedApplication(req, res) {
+  const result = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
+  const application = result.rows[0];
+  if (!application || application.owner_type !== 'user' || application.owner_id !== req.user.sub) {
+    res.status(404).json({ error: 'Application not found.' });
+    return null;
+  }
+  return application;
+}
+
+app.get('/api/applications', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM applications WHERE owner_type = 'user' AND owner_id = $1 ORDER BY created_at DESC`,
+      [req.user.sub]
+    );
+    res.json({ applications: result.rows.map(toPublicApplication) });
+  } catch (err) {
+    console.error('List applications error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/applications', requireAuth, async (req, res) => {
+  try {
+    const { name, environment, description } = req.body || {};
+
+    if (typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Enter an application name.' });
+    }
+    if (!ENVIRONMENTS.includes(environment)) {
+      return res.status(400).json({ error: 'Select a valid environment.' });
+    }
+
+    const trimmedName = name.trim();
+    const existing = await pool.query(
+      `SELECT id FROM applications WHERE owner_type = 'user' AND owner_id = $1 AND lower(name) = lower($2)`,
+      [req.user.sub, trimmedName]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({
+        error: 'The application name must be unique. This means you cannot have applications with the same name and owner.',
+      });
+    }
+
+    const applicationId = crypto.randomUUID();
+    const created = await pool.query(
+      `INSERT INTO applications (id, name, description, environment, owner_type, owner_id, created_by)
+       VALUES ($1, $2, $3, $4, 'user', $5, $5)
+       RETURNING *`,
+      [applicationId, trimmedName, description || null, environment, req.user.sub]
+    );
+
+    const { rawKey } = await issueApiKey(applicationId);
+
+    res.status(201).json({ application: toPublicApplication(created.rows[0]), apiKey: rawKey });
+  } catch (err) {
+    console.error('Create application error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.get('/api/applications/:id', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    const keys = await pool.query(
+      `SELECT id, key_preview, created_at, revoked_at FROM api_keys
+       WHERE application_id = $1 ORDER BY created_at DESC`,
+      [application.id]
+    );
+
+    res.json({
+      application: toPublicApplication(application),
+      apiKeys: keys.rows.map((k) => ({
+        id: k.id,
+        preview: k.key_preview,
+        createdAt: k.created_at,
+        revokedAt: k.revoked_at,
+      })),
+    });
+  } catch (err) {
+    console.error('Get application error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.patch('/api/applications/:id', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    const { description, publicKeyUrl, callbackUrl, customAttributes } = req.body || {};
+    const mergedAttributes = customAttributes
+      ? { ...application.custom_attributes, ...customAttributes }
+      : application.custom_attributes;
+
+    const updated = await pool.query(
+      `UPDATE applications SET
+         description = COALESCE($2, description),
+         public_key_url = COALESCE($3, public_key_url),
+         callback_url = COALESCE($4, callback_url),
+         custom_attributes = $5
+       WHERE id = $1
+       RETURNING *`,
+      [application.id, description ?? null, publicKeyUrl ?? null, callbackUrl ?? null, JSON.stringify(mergedAttributes)]
+    );
+
+    res.json({ application: toPublicApplication(updated.rows[0]) });
+  } catch (err) {
+    console.error('Update application error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/applications/:id/api-keys', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    const { id: keyId, rawKey } = await issueApiKey(application.id);
+    res.status(201).json({ id: keyId, apiKey: rawKey });
+  } catch (err) {
+    console.error('Create API key error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.delete('/api/applications/:id/api-keys/:keyId', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    await pool.query(
+      `UPDATE api_keys SET revoked_at = now() WHERE id = $1 AND application_id = $2 AND revoked_at IS NULL`,
+      [req.params.keyId, application.id]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Revoke API key error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/applications/:id/connected-apis', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    const { id: apiId, name: apiName } = req.body || {};
+    if (!apiId || !apiName) {
+      return res.status(400).json({ error: 'API id and name are required.' });
+    }
+
+    const current = application.connected_apis || [];
+    if (current.some((a) => a.id === apiId)) {
+      return res.status(409).json({ error: 'That API is already connected.' });
+    }
+
+    const updated = await pool.query(
+      `UPDATE applications SET connected_apis = $2 WHERE id = $1 RETURNING *`,
+      [application.id, JSON.stringify([...current, { id: apiId, name: apiName }])]
+    );
+    res.status(201).json({ application: toPublicApplication(updated.rows[0]) });
+  } catch (err) {
+    console.error('Connect API error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.delete('/api/applications/:id/connected-apis/:apiId', requireAuth, async (req, res) => {
+  try {
+    const application = await loadOwnedApplication(req, res);
+    if (!application) return;
+
+    const updated = await pool.query(
+      `UPDATE applications SET connected_apis = $2 WHERE id = $1 RETURNING *`,
+      [application.id, JSON.stringify((application.connected_apis || []).filter((a) => a.id !== req.params.apiId))]
+    );
+    res.json({ application: toPublicApplication(updated.rows[0]) });
+  } catch (err) {
+    console.error('Disconnect API error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
