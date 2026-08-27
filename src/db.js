@@ -66,6 +66,28 @@ async function initDb() {
       revoked_at TIMESTAMPTZ
     );
   `);
+
+  // Submissions from the three "ask the marketplace team for something"
+  // forms - request API access, publish an API, request a new API - so a
+  // signed-in user can see their own submission history on their account
+  // dashboard. `details` is deliberately a JSONB bag rather than a column
+  // per field, the same choice already made for applications.custom_attributes:
+  // the three forms collect different fields, and a schema change every time
+  // a form's fields change is worse than one flexible column all three share.
+  // `status` has no CHECK constraint - there is no review workflow yet, only
+  // ever 'submitted', and constraining it now would just mean a migration
+  // later to add whatever status a real workflow needs.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS requests (
+      id UUID PRIMARY KEY,
+      kind TEXT NOT NULL CHECK (kind IN ('access-request', 'publish-api', 'new-api')),
+      owner_id INTEGER NOT NULL REFERENCES users(id),
+      reference TEXT NOT NULL UNIQUE,
+      status TEXT NOT NULL DEFAULT 'submitted',
+      details JSONB NOT NULL DEFAULT '{}',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
 }
 
 module.exports = { pool, initDb };

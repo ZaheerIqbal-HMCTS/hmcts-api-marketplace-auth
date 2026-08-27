@@ -116,59 +116,6 @@ app.get('/api/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.post('/api/requests/access', authLimiter, async (req, res) => {
-  try {
-    const { fullName, organisation, email, jobTitle, apiName, environment, callVolume, useCase } = req.body || {};
-
-    if (!fullName || !organisation || !email || !apiName || !environment || !useCase) {
-      return res.status(400).json({ error: 'Missing required fields.' });
-    }
-    if (!isValidEmail(email)) {
-      return res.status(400).json({ error: 'Enter a valid email address.' });
-    }
-
-    const reference = 'AR-' + new Date().getFullYear() + '-' + Math.random().toString(36).slice(2, 8).toUpperCase();
-
-    await pool.query(
-      `INSERT INTO access_requests (full_name, organisation, email, job_title, api_name, environment, call_volume, use_case, reference)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-      [fullName, organisation, email, jobTitle || null, apiName, environment, callVolume || null, useCase, reference]
-    );
-
-    if (mailTransporter && process.env.API_OWNER_EMAIL) {
-      try {
-        await mailTransporter.sendMail({
-          from: process.env.SMTP_FROM || process.env.SMTP_USER,
-          to: process.env.API_OWNER_EMAIL,
-          replyTo: email,
-          subject: `[HMCTS API Marketplace] Access request for ${apiName} (${reference})`,
-          text:
-            `A new API access request has been submitted.\n\n` +
-            `Reference: ${reference}\n` +
-            `API requested: ${apiName}\n` +
-            `Environment: ${environment}\n` +
-            `Expected call volume: ${callVolume || 'Not specified'}\n\n` +
-            `Requested by: ${fullName}${jobTitle ? ' (' + jobTitle + ')' : ''}\n` +
-            `Organisation: ${organisation}\n` +
-            `Email: ${email}\n\n` +
-            `Use case:\n${useCase}\n`,
-        });
-      } catch (mailErr) {
-        // Don't fail the whole request just because email sending had a problem -
-        // the request is already safely stored in the database either way.
-        console.error('Failed to send access request email:', mailErr);
-      }
-    } else {
-      console.log(`Access request ${reference} stored (no email sent - SMTP/API_OWNER_EMAIL not fully configured).`);
-    }
-
-    res.status(201).json({ reference });
-  } catch (err) {
-    console.error('Access request error:', err);
-    res.status(500).json({ error: 'Something went wrong. Please try again.' });
-  }
-});
-
 app.post('/api/register', authLimiter, async (req, res) => {
   try {
     const { firstName, lastName, email, organisation, role, password } = req.body || {};
@@ -482,6 +429,69 @@ app.delete('/api/applications/:id/connected-apis/:apiId', requireAuth, async (re
     res.json({ application: toPublicApplication(updated.rows[0]) });
   } catch (err) {
     console.error('Disconnect API error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Requests - submissions from the three "ask the marketplace team for
+// something" forms (request API access, publish an API, request a new API).
+// Stored against the signed-in user who submitted them, so their account
+// dashboard can list their own submission history. No review workflow yet -
+// every request just sits at status 'submitted'.
+
+const REQUEST_KINDS = ['access-request', 'publish-api', 'new-api'];
+const REQUEST_REFERENCE_PREFIX = { 'access-request': 'AR', 'publish-api': 'PA', 'new-api': 'NA' };
+
+function toPublicRequest(row) {
+  return {
+    id: row.id,
+    kind: row.kind,
+    reference: row.reference,
+    status: row.status,
+    details: row.details,
+    createdAt: row.created_at,
+  };
+}
+
+app.get('/api/requests', requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT * FROM requests WHERE owner_id = $1 ORDER BY created_at DESC`,
+      [req.user.sub]
+    );
+    res.json({ requests: result.rows.map(toPublicRequest) });
+  } catch (err) {
+    console.error('List requests error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/requests', requireAuth, async (req, res) => {
+  try {
+    const { kind, details } = req.body || {};
+
+    if (!REQUEST_KINDS.includes(kind)) {
+      return res.status(400).json({ error: 'Unknown request kind.' });
+    }
+    if (!details || typeof details !== 'object' || Array.isArray(details)) {
+      return res.status(400).json({ error: 'Request details are required.' });
+    }
+
+    const id = crypto.randomUUID();
+    const reference = REQUEST_REFERENCE_PREFIX[kind] + '-' + new Date().getFullYear() + '-' +
+      crypto.randomBytes(3).toString('hex').toUpperCase();
+
+    const created = await pool.query(
+      `INSERT INTO requests (id, kind, owner_id, reference, details)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [id, kind, req.user.sub, reference, JSON.stringify(details)]
+    );
+
+    res.status(201).json({ request: toPublicRequest(created.rows[0]) });
+  } catch (err) {
+    console.error('Create request error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
