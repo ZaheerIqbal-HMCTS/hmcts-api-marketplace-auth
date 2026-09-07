@@ -79,6 +79,23 @@ async function initDb() {
     END $$;
   `);
 
+  // Team members - Phase 2 of the design doc. An application's owner can
+  // invite others by email; membership is looked up by the signed-in
+  // caller's own email (from their JWT), not a foreign key to users.id, so
+  // inviting someone who hasn't registered yet still works - their row just
+  // sits unmatched until they sign up with that address. The owner is not a
+  // row here; they always have full access, checked separately.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS application_team_members (
+      id UUID PRIMARY KEY,
+      application_id UUID NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+      email TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('developer', 'administrator')),
+      added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      UNIQUE (application_id, email)
+    );
+  `);
+
   // Raw keys are never stored, only bcrypt hashes, matching password
   // handling above - the raw value is returned once, at creation time, and
   // never again. key_preview (last 4 chars) is what the UI shows afterwards.
