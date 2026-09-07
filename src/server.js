@@ -280,14 +280,19 @@ app.post('/api/applications', requireAuth, async (req, res) => {
       return res.status(400).json({ error: 'Select a valid environment.' });
     }
 
+    // Uniqueness is scoped per environment, not just per owner - this is what
+    // lets the same logical application be registered separately for sandbox
+    // and production, each with its own credentials, the way HMRC's
+    // Developer Hub treats a sandbox and a production application as two
+    // distinct registrations sharing a name.
     const trimmedName = name.trim();
     const existing = await pool.query(
-      `SELECT id FROM applications WHERE owner_type = 'user' AND owner_id = $1 AND lower(name) = lower($2)`,
-      [req.user.sub, trimmedName]
+      `SELECT id FROM applications WHERE owner_type = 'user' AND owner_id = $1 AND lower(name) = lower($2) AND environment = $3`,
+      [req.user.sub, trimmedName, environment]
     );
     if (existing.rows.length > 0) {
       return res.status(409).json({
-        error: 'The application name must be unique. This means you cannot have applications with the same name and owner.',
+        error: 'You already have an application with this name in this environment. Choose a different name, or a different environment to register this one in.',
       });
     }
 
