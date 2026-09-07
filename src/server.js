@@ -515,12 +515,18 @@ app.get('/api/applications/:id/team-members', requireAuth, async (req, res) => {
     const application = await loadAccessibleApplication(req, res, 'developer');
     if (!application) return;
 
-    const members = await pool.query(
-      `SELECT * FROM application_team_members WHERE application_id = $1 ORDER BY added_at ASC`,
-      [application.id]
-    );
+    const [owner, members] = await Promise.all([
+      pool.query(`SELECT email FROM users WHERE id = $1`, [application.owner_id]),
+      pool.query(
+        `SELECT * FROM application_team_members WHERE application_id = $1 ORDER BY added_at ASC`,
+        [application.id]
+      ),
+    ]);
 
-    res.json({ teamMembers: members.rows.map(toPublicTeamMember) });
+    res.json({
+      ownerEmail: owner.rows[0] ? owner.rows[0].email : null,
+      teamMembers: members.rows.map(toPublicTeamMember),
+    });
   } catch (err) {
     console.error('List team members error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
