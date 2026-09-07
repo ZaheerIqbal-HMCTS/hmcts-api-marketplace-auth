@@ -225,8 +225,17 @@ function toPublicApplication(row) {
     customAttributes: row.custom_attributes,
     connectedApis: row.connected_apis,
     createdAt: row.created_at,
+    // Set by loadAccessibleApplication / the list query below - the calling
+    // user's own role on this specific application, so the frontend can
+    // show or hide administrator-only actions (change details, manage
+    // secrets, manage the team) without a second round trip.
+    viewerRole: row.viewer_role || 'owner',
   };
 }
+
+// Permission tiers, ranked. 'owner' is not a application_team_members row -
+// it's whoever created the application, and always outranks any team role.
+const ROLE_RANK = { developer: 1, administrator: 2, owner: 3 };
 
 function newApiKey() {
   return 'amp_' + crypto.randomBytes(24).toString('hex');
@@ -243,24 +252,62 @@ async function issueApiKey(applicationId) {
   return { id: keyId, rawKey };
 }
 
-// Loads an application and checks the current user owns it, writing the
-// appropriate error response and returning null if not - every route below
-// that takes :id calls this first and returns immediately when it does.
-async function loadOwnedApplication(req, res) {
+// Loads an application and checks the current user can access it at at
+// least minRole, writing the appropriate error response and returning null
+// if not - every route below that takes :id calls this first and returns
+// immediately when it does.
+//
+// The owner always has full access, and is not a application_team_members
+// row - a team member's access comes from a row matching their own email
+// (from their JWT, not a foreign key to users.id, so inviting someone who
+// hasn't registered yet still works). A caller who is neither gets exactly
+// the same 404 as an application that doesn't exist, so this never confirms
+// an application's existence to someone with no access to it.
+async function loadAccessibleApplication(req, res, minRole) {
   const result = await pool.query('SELECT * FROM applications WHERE id = $1', [req.params.id]);
   const application = result.rows[0];
-  if (!application || application.owner_type !== 'user' || application.owner_id !== req.user.sub) {
+  if (!application || application.owner_type !== 'user') {
     res.status(404).json({ error: 'Application not found.' });
     return null;
   }
+
+  let role = null;
+  if (application.owner_id === req.user.sub) {
+    role = 'owner';
+  } else {
+    const member = await pool.query(
+      `SELECT role FROM application_team_members WHERE application_id = $1 AND lower(email) = lower($2)`,
+      [application.id, req.user.email]
+    );
+    if (member.rows[0]) role = member.rows[0].role;
+  }
+
+  if (!role) {
+    res.status(404).json({ error: 'Application not found.' });
+    return null;
+  }
+  if (ROLE_RANK[role] < ROLE_RANK[minRole]) {
+    res.status(403).json({ error: 'You do not have permission to do this.' });
+    return null;
+  }
+
+  application.viewer_role = role;
   return application;
 }
 
 app.get('/api/applications', requireAuth, async (req, res) => {
   try {
+    // Includes applications the caller is a team member on, not just ones
+    // they own - matching HMRC's "View all applications" list, which shows
+    // a "Your role" column rather than only the applications you created.
     const result = await pool.query(
-      `SELECT * FROM applications WHERE owner_type = 'user' AND owner_id = $1 ORDER BY created_at DESC`,
-      [req.user.sub]
+      `SELECT a.*, CASE WHEN a.owner_id = $1 THEN 'owner' ELSE tm.role END AS viewer_role
+       FROM applications a
+       LEFT JOIN application_team_members tm
+         ON tm.application_id = a.id AND lower(tm.email) = lower($2)
+       WHERE a.owner_type = 'user' AND (a.owner_id = $1 OR tm.email IS NOT NULL)
+       ORDER BY a.created_at DESC`,
+      [req.user.sub, req.user.email]
     );
     res.json({ applications: result.rows.map(toPublicApplication) });
   } catch (err) {
@@ -315,7 +362,7 @@ app.post('/api/applications', requireAuth, async (req, res) => {
 
 app.get('/api/applications/:id', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    const application = await loadAccessibleApplication(req, res, 'developer');
     if (!application) return;
 
     const keys = await pool.query(
@@ -341,7 +388,9 @@ app.get('/api/applications/:id', requireAuth, async (req, res) => {
 
 app.patch('/api/applications/:id', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    // Administrator-only: changing application details is not a Developer
+    // permission (see the Team members roles below).
+    const application = await loadAccessibleApplication(req, res, 'administrator');
     if (!application) return;
 
     const { description, publicKeyUrl, callbackUrl, customAttributes } = req.body || {};
@@ -369,7 +418,9 @@ app.patch('/api/applications/:id', requireAuth, async (req, res) => {
 
 app.post('/api/applications/:id/api-keys', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    // Administrator-only: HMRC's Developer role can test with existing
+    // credentials but does not generate or revoke them.
+    const application = await loadAccessibleApplication(req, res, 'administrator');
     if (!application) return;
 
     const { id: keyId, rawKey } = await issueApiKey(application.id);
@@ -382,7 +433,7 @@ app.post('/api/applications/:id/api-keys', requireAuth, async (req, res) => {
 
 app.delete('/api/applications/:id/api-keys/:keyId', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    const application = await loadAccessibleApplication(req, res, 'administrator');
     if (!application) return;
 
     await pool.query(
@@ -398,7 +449,8 @@ app.delete('/api/applications/:id/api-keys/:keyId', requireAuth, async (req, res
 
 app.post('/api/applications/:id/connected-apis', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    // Developer permission: "Subscribe to sandbox APIs" per HMRC's role list.
+    const application = await loadAccessibleApplication(req, res, 'developer');
     if (!application) return;
 
     const { id: apiId, name: apiName } = req.body || {};
@@ -424,7 +476,7 @@ app.post('/api/applications/:id/connected-apis', requireAuth, async (req, res) =
 
 app.delete('/api/applications/:id/connected-apis/:apiId', requireAuth, async (req, res) => {
   try {
-    const application = await loadOwnedApplication(req, res);
+    const application = await loadAccessibleApplication(req, res, 'developer');
     if (!application) return;
 
     const updated = await pool.query(
@@ -434,6 +486,109 @@ app.delete('/api/applications/:id/connected-apis/:apiId', requireAuth, async (re
     res.json({ application: toPublicApplication(updated.rows[0]) });
   } catch (err) {
     console.error('Disconnect API error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Team members - Phase 2 of the design doc, added on top of Phase 1's
+// single-owner model. Two roles, matching HMRC Developer Hub's Developer /
+// Administrator split:
+//   developer     - view the application, test with existing credentials,
+//                   subscribe/unsubscribe sandbox APIs, view the team
+//   administrator - everything a developer can, plus change application
+//                   details, manage client secrets, add/remove team members
+// The owner is not a row in this table - they always outrank both roles and
+// can't be removed via this endpoint (there's nothing to remove).
+
+function toPublicTeamMember(row) {
+  return {
+    id: row.id,
+    email: row.email,
+    role: row.role,
+    addedAt: row.added_at,
+  };
+}
+
+app.get('/api/applications/:id/team-members', requireAuth, async (req, res) => {
+  try {
+    const application = await loadAccessibleApplication(req, res, 'developer');
+    if (!application) return;
+
+    const members = await pool.query(
+      `SELECT * FROM application_team_members WHERE application_id = $1 ORDER BY added_at ASC`,
+      [application.id]
+    );
+
+    res.json({ teamMembers: members.rows.map(toPublicTeamMember) });
+  } catch (err) {
+    console.error('List team members error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.post('/api/applications/:id/team-members', requireAuth, async (req, res) => {
+  try {
+    const application = await loadAccessibleApplication(req, res, 'administrator');
+    if (!application) return;
+
+    const { email, role } = req.body || {};
+    if (typeof email !== 'string' || !email.trim()) {
+      return res.status(400).json({ error: 'Enter an email address.' });
+    }
+    if (!['developer', 'administrator'].includes(role)) {
+      return res.status(400).json({ error: 'Select a permission level.' });
+    }
+
+    const trimmedEmail = email.trim();
+
+    if (trimmedEmail.toLowerCase() === req.user.email.toLowerCase()) {
+      return res.status(400).json({ error: 'You already have access to this application.' });
+    }
+
+    const existing = await pool.query(
+      `SELECT id FROM application_team_members WHERE application_id = $1 AND lower(email) = lower($2)`,
+      [application.id, trimmedEmail]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(409).json({ error: 'That person is already a team member on this application.' });
+    }
+
+    const id = crypto.randomUUID();
+    const created = await pool.query(
+      `INSERT INTO application_team_members (id, application_id, email, role)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [id, application.id, trimmedEmail, role]
+    );
+
+    res.status(201).json({ teamMember: toPublicTeamMember(created.rows[0]) });
+  } catch (err) {
+    console.error('Add team member error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
+app.delete('/api/applications/:id/team-members/:memberId', requireAuth, async (req, res) => {
+  try {
+    const application = await loadAccessibleApplication(req, res, 'administrator');
+    if (!application) return;
+
+    const member = await pool.query(
+      `SELECT * FROM application_team_members WHERE id = $1 AND application_id = $2`,
+      [req.params.memberId, application.id]
+    );
+    if (!member.rows[0]) {
+      return res.status(404).json({ error: 'Team member not found.' });
+    }
+    if (member.rows[0].email.toLowerCase() === req.user.email.toLowerCase()) {
+      return res.status(400).json({ error: 'You cannot remove yourself from this application.' });
+    }
+
+    await pool.query(`DELETE FROM application_team_members WHERE id = $1`, [req.params.memberId]);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Remove team member error:', err);
     res.status(500).json({ error: 'Something went wrong. Please try again.' });
   }
 });
