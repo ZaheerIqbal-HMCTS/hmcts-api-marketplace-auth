@@ -49,8 +49,34 @@ async function initDb() {
       custom_attributes JSONB NOT NULL DEFAULT '{}',
       connected_apis JSONB NOT NULL DEFAULT '[]',
       created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-      UNIQUE (owner_type, owner_id, name)
+      UNIQUE (owner_type, owner_id, name, environment)
     );
+  `);
+
+  // Migration for databases created before the uniqueness constraint above
+  // included environment - CREATE TABLE IF NOT EXISTS is a no-op against an
+  // existing table, so an already-deployed database keeps its original
+  // (owner_type, owner_id, name) constraint (with no way to hold a sandbox
+  // and a production application under the same name) until this runs.
+  // Idempotent: safe to run on every boot, on a database that's already
+  // been migrated or one that was created fresh with the constraint above.
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'applications_owner_type_owner_id_name_key'
+      ) THEN
+        ALTER TABLE applications DROP CONSTRAINT applications_owner_type_owner_id_name_key;
+      END IF;
+
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'applications_owner_type_owner_id_name_environment_key'
+      ) THEN
+        ALTER TABLE applications
+          ADD CONSTRAINT applications_owner_type_owner_id_name_environment_key
+          UNIQUE (owner_type, owner_id, name, environment);
+      END IF;
+    END $$;
   `);
 
   // Raw keys are never stored, only bcrypt hashes, matching password
