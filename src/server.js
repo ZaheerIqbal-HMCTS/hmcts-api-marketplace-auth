@@ -416,6 +416,27 @@ app.patch('/api/applications/:id', requireAuth, async (req, res) => {
   }
 });
 
+app.delete('/api/applications/:id', requireAuth, async (req, res) => {
+  try {
+    // Owner-only, not just Administrator - this is the one action that
+    // outranks Administrator, since it takes the application (and every
+    // team member's access to it) away from everyone at once, not just
+    // something an Administrator can undo by re-inviting people.
+    const application = await loadAccessibleApplication(req, res, 'owner');
+    if (!application) return;
+
+    // api_keys and application_team_members cascade on application_id (see
+    // db.js); connected_apis and custom_attributes are columns on this same
+    // row, so a single delete removes everything.
+    await pool.query('DELETE FROM applications WHERE id = $1', [application.id]);
+
+    res.status(204).end();
+  } catch (err) {
+    console.error('Delete application error:', err);
+    res.status(500).json({ error: 'Something went wrong. Please try again.' });
+  }
+});
+
 app.post('/api/applications/:id/api-keys', requireAuth, async (req, res) => {
   try {
     // Administrator-only: HMRC's Developer role can test with existing
